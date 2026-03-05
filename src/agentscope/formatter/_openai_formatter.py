@@ -9,19 +9,11 @@ from urllib.parse import urlparse
 
 import requests
 
-from ._truncated_formatter_base import TruncatedFormatterBase
 from .._logging import logger
-from ..message import (
-    Msg,
-    URLSource,
-    TextBlock,
-    ImageBlock,
-    AudioBlock,
-    Base64Source,
-    ToolUseBlock,
-    ToolResultBlock,
-)
+from ..message import (AudioBlock, Base64Source, ImageBlock, Msg, TextBlock,
+                       ThinkingBlock, ToolResultBlock, ToolUseBlock, URLSource)
 from ..token import TokenCounterBase
+from ._truncated_formatter_base import TruncatedFormatterBase
 
 
 def _format_openai_image_block(
@@ -176,6 +168,7 @@ class OpenAIChatFormatter(TruncatedFormatterBase):
         AudioBlock,
         ToolUseBlock,
         ToolResultBlock,
+        ThinkingBlock,
     ]
     """Supported message blocks for OpenAI API"""
 
@@ -335,6 +328,10 @@ class OpenAIChatFormatter(TruncatedFormatterBase):
                             "input_audio": input_audio,
                         },
                     )
+
+                elif typ == "thinking":
+                    # 将 reasoning/thinking 作为 text 发送给 API，或者根据业务定制
+                    content_blocks.append({"type": "text", "text": block["thinking"]})
 
                 else:
                     logger.warning(
@@ -519,6 +516,15 @@ class OpenAIMultiAgentFormatter(TruncatedFormatterBase):
         if audios:
             content_list.extend(audios)
 
+        user_message = {
+            "role": "user",
+            "content": content_list,
+        }
+
+        if content_list:
+            formatted_msgs.append(user_message)
+
+        return formatted_msgs
         user_message = {
             "role": "user",
             "content": content_list,
