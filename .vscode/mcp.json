@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "my-mcp-server-edbd737a": {
+      "url": "http://127.0.0.1:12306/mcp", // 本地浏览器操控
+      "type": "http"
+    },
+    "deepwiki": { // 在搜索代码仓库时，使用deepwiki能得到更精准的结果，还免费
+      "url": "https://mcp.deepwiki.com/mcp", 
+      "type": "http"
+    }
+  },
+  "inputs": []
+}
