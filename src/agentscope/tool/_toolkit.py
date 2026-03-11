@@ -9,49 +9,24 @@ import inspect
 import os
 from copy import deepcopy
 from functools import partial, wraps
-from typing import (
-    AsyncGenerator,
-    Literal,
-    Any,
-    Type,
-    Generator,
-    Callable,
-    Awaitable,
-    Coroutine,
-)
+from typing import (Any, AsyncGenerator, Awaitable, Callable, Coroutine,
+                    Generator, Literal, Type)
 
 import mcp
 import shortuuid
-from pydantic import (
-    BaseModel,
-    Field,
-    create_model,
-)
+from pydantic import BaseModel, Field, create_model
 
-from ._async_wrapper import (
-    _async_generator_wrapper,
-    _object_wrapper,
-    _sync_generator_wrapper,
-)
-from ._response import ToolResponse
-from ._types import ToolGroup, AgentSkill, RegisteredToolFunction
-from .._utils._common import _parse_tool_function
-from ..mcp import (
-    MCPToolFunction,
-    MCPClientBase,
-    StatefulClientBase,
-)
-from ..message import (
-    ToolUseBlock,
-    TextBlock,
-)
-from ..module import StateModule
-from ..types import (
-    JSONSerializableObject,
-    ToolFunction,
-)
-from ..tracing._trace import trace_toolkit
 from .._logging import logger
+from .._utils._common import _parse_tool_function
+from ..mcp import MCPClientBase, MCPToolFunction, StatefulClientBase
+from ..message import TextBlock, ToolUseBlock
+from ..module import StateModule
+from ..tracing._trace import trace_toolkit
+from ..types import JSONSerializableObject, ToolFunction
+from ._async_wrapper import (_async_generator_wrapper, _object_wrapper,
+                             _sync_generator_wrapper)
+from ._response import ToolResponse
+from ._types import AgentSkill, RegisteredToolFunction, ToolGroup
 
 
 def _apply_middlewares(
@@ -394,12 +369,32 @@ Check "{dir}/SKILL.md" for how to use this skill"""
 
             input_func_name = tool_func.func.__name__
             original_func = tool_func.func
-            json_schema = json_schema or _parse_tool_function(
-                tool_func.func,
-                include_long_description=include_long_description,
-                include_var_positional=include_var_positional,
-                include_var_keyword=include_var_keyword,
-            )
+
+            # When generating the JSON schema we should ignore any
+            # parameters that have already been bound by the partial; doing
+            # so avoids pydantic errors when those parameters carry
+            # arbitrary types (e.g. ``Toolkit``) that cannot be turned into
+            # a JSON schema.  Previously we waited until *after* schema
+            # creation to strip preset kwargs, but the failure occurs during
+            # schema generation itself.
+            if json_schema is None:
+                func_for_schema = tool_func.func
+                if preset_kwargs:
+                    # create a lightweight wrapper with a trimmed signature
+                    sig = inspect.signature(tool_func.func)
+                    keep = [p for p in sig.parameters.values() if p.name not in preset_kwargs]
+                    if len(keep) != len(sig.parameters):
+                        def _wrapper(*args, **kwargs):
+                            return tool_func.func(*args, **kwargs)
+                        _wrapper.__signature__ = sig.replace(parameters=keep)
+                        func_for_schema = _wrapper
+
+                json_schema = _parse_tool_function(
+                    func_for_schema,
+                    include_long_description=include_long_description,
+                    include_var_positional=include_var_positional,
+                    include_var_keyword=include_var_keyword,
+                )
 
         else:
             # normal function

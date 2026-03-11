@@ -7,12 +7,14 @@ import json
 import os
 import sys
 import tempfile
+from functools import partial
 from typing import Any
 
 import shortuuid
 from dotenv import load_dotenv
 
-from agentscope.agent import ReActAgent
+from agentscope.agent import CustomReActAgent
+# CompressionConfig is defined in the internal react agent module
 from agentscope.formatter import OpenAIChatFormatter
 from agentscope.memory import InMemoryMemory
 from agentscope.message import Msg, TextBlock
@@ -66,14 +68,154 @@ def _now_iso() -> str:
     return datetime.datetime.now().isoformat()
 
 
-class GroupChatManager:
-    """Manage chat rooms and fan-out messages to room subscribers."""
+class AgentRuntimeContext:
+    """Store per-agent background-task and subscription state."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._subscription_result_queues: dict[
+            str,
+            asyncio.Queue[dict[str, Any]],
+        ] = {
+            "default": asyncio.Queue(),
+            "notify": asyncio.Queue(),
+        }
+
+    def create_task_record(
+        self,
+        *,
+        task_id: str,
+        created_at: str,
+        message: str,
+        subscribe: bool,
+        **extra_fields: Any,
+    ) -> dict[str, Any]:
+        """Create, store, and return metadata for one background task."""
+
+        metadata: dict[str, Any] = {
+            "status": "queued",
+            "created_at": created_at,
+            "start_iso_time": created_at,
+            "last_received_iso_time": None,
+            "message": message,
+            "future": None,
+            "subscribe": subscribe,
+            **extra_fields,
+        }
+        self._tasks[task_id] = metadata
+        return metadata
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        """Return stored metadata for one task id."""
+
+        return self._tasks.get(task_id)
+
+    def set_task_future(
+        self,
+        task_id: str,
+        future: asyncio.Task[Any],
+    ) -> None:
+        """Attach the created asyncio task to its metadata."""
+
+        self._tasks[task_id]["future"] = future
+
+    def select_subscription_queue_name(
+        self,
+        subscription_message: dict[str, Any],
+    ) -> str:
+        """Select the target subscription queue name."""
+
+        if subscription_message.get("notify") is True:
+            return "notify"
+        return "default"
+
+    async def publish_subscription_message(
+        self,
+        subscription_message: dict[str, Any],
+    ) -> None:
+        """Publish one subscription message into the selected queue."""
+
+        queue_name = self.select_subscription_queue_name(
+            subscription_message,
+        )
+        await self._subscription_result_queues[queue_name].put(
+            subscription_message,
+        )
+
+    async def get_subscription_message(
+        self,
+        include_notify: bool = True,
+    ) -> dict[str, Any]:
+        """Wait until one subscription message is available."""
+
+        get_tasks = [
+            asyncio.create_task(
+                self._subscription_result_queues["default"].get(),
+            ),
+        ]
+        if include_notify:
+            get_tasks.append(
+                asyncio.create_task(
+                    self._subscription_result_queues["notify"].get(),
+                )
+            )
+
+        done, pending = await asyncio.wait(
+            get_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for pending_task in pending:
+            pending_task.cancel()
+
+        completed_task = next(iter(done))
+        return completed_task.result()
+
+    def pop_subscription_message_nowait(
+        self,
+        queue_name: str,
+    ) -> dict[str, Any]:
+        """Return one queued subscription message without waiting."""
+
+        return self._subscription_result_queues[queue_name].get_nowait()
+
+    async def put_subscription_message(
+        self,
+        queue_name: str,
+        one_message: dict[str, Any],
+    ) -> None:
+        """Put one message back into a subscription queue."""
+
+        await self._subscription_result_queues[queue_name].put(one_message)
+
+    def touch_message_timestamp(
+        self,
+        one_message: dict[str, Any],
+    ) -> None:
+        """Refresh one subscription payload with the latest receive time."""
+
+        start_iso_time = one_message.get("start_iso_time")
+        last_received_iso_time = _now_iso()
+
+        one_message["start_iso_time"] = start_iso_time
+        one_message["last_received_iso_time"] = last_received_iso_time
+
+        task_id = one_message.get("task_id")
+        if isinstance(task_id, str) and task_id in self._tasks:
+            self._tasks[task_id]["last_received_iso_time"] = (
+                last_received_iso_time
+            )
+
+
+class GroupChatService:
+    """Manage shared chat rooms and fan-out messages across agents."""
 
     def __init__(self) -> None:
         self._room_subscribers: dict[
             str,
             set[asyncio.Queue[dict[str, Any]]],
         ] = {}
+        self.add_room("global")
 
     def add_room(self, room_name: str) -> None:
         """Add a room if it does not exist."""
@@ -131,40 +273,12 @@ class GroupChatManager:
 
         return True, delivered_count
 
-# 简单的内存结构，用于在阻塞=False 时跟踪生成的任务
-# 每个条目映射 task_id -> 元数据字典，包含状态、时间戳和
-# 底层的 asyncio.Task 对象。  这是故意最小化的；在一个
-# 您需要持久性、锁定、取消支持的生产环境，
-_tasks: dict[str, dict] = {}
-_subscription_result_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {
-    "default": asyncio.Queue(),
-    "notify": asyncio.Queue(),
-}
-_group_chat_manager = GroupChatManager()
-_group_chat_manager.add_room("global")
-
-def _select_subscription_queue_name(
-    subscription_message: dict[str, Any],
-) -> str:
-    """Select queue name based on message flags."""
-
-    if subscription_message.get("notify") is True:
-        return "notify"
-    return "default"
-
-async def _publish_subscription_message(
-    subscription_message: dict[str, Any],
-) -> None:
-    """Publish subscription message into configured queue."""
-
-    queue_name = _select_subscription_queue_name(subscription_message)
-    await _subscription_result_queues[queue_name].put(subscription_message)
-
 async def execute_python_code(
     code: str,
     timeout: float = 300,
     blocking: bool = True,
     subscribe: bool = False,
+    runtime_context: AgentRuntimeContext | None = None,
     **kwargs: Any,
 ) -> ToolResponse:
     """Execute Python code, optionally in a background task.
@@ -187,6 +301,9 @@ async def execute_python_code(
             The execution result when blocking, or task metadata when
             non-blocking.
     """
+
+    if runtime_context is None:
+        raise ValueError("runtime_context is required.")
 
     parsed_blocking = _parse_json_if_needed(blocking)
     parsed_subscribe = _parse_json_if_needed(subscribe)
@@ -271,15 +388,12 @@ async def execute_python_code(
 
     task_id = shortuuid.uuid()
     created_at = _now_iso()
-    metadata: dict[str, Any] = {
-        "status": "queued",
-        "created_at": created_at,
-        "start_iso_time": created_at,
-        "last_received_iso_time": None,
-        "message": "Task started successfully.",
-        "future": None,
-        "subscribe": parsed_subscribe,
-    }
+    metadata = runtime_context.create_task_record(
+        task_id=task_id,
+        created_at=created_at,
+        message="Task started successfully.",
+        subscribe=parsed_subscribe,
+    )
 
     async def _wrapper() -> ToolResponse:
         metadata["status"] = "running"
@@ -291,7 +405,7 @@ async def execute_python_code(
             if metadata["subscribe"]:
                 last_received_iso_time = _now_iso()
                 metadata["last_received_iso_time"] = last_received_iso_time
-                await _publish_subscription_message(
+                await runtime_context.publish_subscription_message(
                     {
                         "task_id": task_id,
                         "name": "execute_python_code",
@@ -310,7 +424,7 @@ async def execute_python_code(
             if metadata["subscribe"]:
                 last_received_iso_time = _now_iso()
                 metadata["last_received_iso_time"] = last_received_iso_time
-                await _publish_subscription_message(
+                await runtime_context.publish_subscription_message(
                     {
                         "task_id": task_id,
                         "name": "execute_python_code",
@@ -324,8 +438,7 @@ async def execute_python_code(
             raise
 
     fut = asyncio.create_task(_wrapper())
-    metadata["future"] = fut
-    _tasks[task_id] = metadata
+    runtime_context.set_task_future(task_id, fut)
 
     return ToolResponse(
         content=[
@@ -353,6 +466,7 @@ async def execute_python_code(
 async def subscribe_system_time(
     interval_seconds: float = 4,
     notify_reminder: bool = False,
+    runtime_context: AgentRuntimeContext | None = None,
     **kwargs: Any,
 ) -> ToolResponse:
     """Subscribe system time updates and publish them to the queue.
@@ -368,6 +482,9 @@ async def subscribe_system_time(
         `ToolResponse`:
             Task metadata for the background subscription publisher.
     """
+
+    if runtime_context is None:
+        raise ValueError("runtime_context is required.")
 
     parsed_interval = _parse_json_if_needed(interval_seconds)
     parsed_notify_reminder = _parse_json_if_needed(notify_reminder)
@@ -405,15 +522,12 @@ async def subscribe_system_time(
 
     task_id = shortuuid.uuid()
     created_at = _now_iso()
-    metadata: dict[str, Any] = {
-        "status": "queued",
-        "created_at": created_at,
-        "start_iso_time": created_at,
-        "last_received_iso_time": None,
-        "message": "System time subscription started.",
-        "future": None,
-        "subscribe": True,
-    }
+    metadata = runtime_context.create_task_record(
+        task_id=task_id,
+        created_at=created_at,
+        message="System time subscription started.",
+        subscribe=True,
+    )
 
     async def _publisher() -> None:
         metadata["status"] = "running"
@@ -423,7 +537,7 @@ async def subscribe_system_time(
                 last_received_iso_time = _now_iso()
                 metadata["last_received_iso_time"] = last_received_iso_time
 
-                await _publish_subscription_message(
+                await runtime_context.publish_subscription_message(
                     {
                         "task_id": task_id,
                         "name": "subscribe_system_time",
@@ -444,7 +558,7 @@ async def subscribe_system_time(
             metadata["message"] = str(exc)
             last_received_iso_time = _now_iso()
             metadata["last_received_iso_time"] = last_received_iso_time
-            await _publish_subscription_message(
+            await runtime_context.publish_subscription_message(
                 {
                     "task_id": task_id,
                     "name": "subscribe_system_time",
@@ -457,8 +571,7 @@ async def subscribe_system_time(
             raise
 
     fut = asyncio.create_task(_publisher())
-    metadata["future"] = fut
-    _tasks[task_id] = metadata
+    runtime_context.set_task_future(task_id, fut)
 
     return ToolResponse(
         content=[
@@ -484,10 +597,11 @@ async def subscribe_system_time(
         ],
     )
 
-
 async def subscribe_group_chat_messages(
     room_name: str = "global",
     notify_reminder: bool = False,
+    runtime_context: AgentRuntimeContext | None = None,
+    group_chat_service: GroupChatService | None = None,
     **kwargs: Any,
 ) -> ToolResponse:
     """Subscribe group chat messages and publish them to wait queues.
@@ -502,6 +616,11 @@ async def subscribe_group_chat_messages(
         `ToolResponse`:
             Task metadata for the background room subscription.
     """
+
+    if runtime_context is None:
+        raise ValueError("runtime_context is required.")
+    if group_chat_service is None:
+        raise ValueError("group_chat_service is required.")
 
     parsed_room_name = _parse_json_if_needed(room_name)
     parsed_notify_reminder = _parse_json_if_needed(notify_reminder)
@@ -527,22 +646,19 @@ async def subscribe_group_chat_messages(
         )
 
     normalized_room_name = parsed_room_name.strip()
-    _group_chat_manager.add_room(normalized_room_name)
+    group_chat_service.add_room(normalized_room_name)
 
     task_id = shortuuid.uuid()
     created_at = _now_iso()
-    metadata: dict[str, Any] = {
-        "status": "queued",
-        "created_at": created_at,
-        "start_iso_time": created_at,
-        "last_received_iso_time": None,
-        "message": "Group chat subscription started.",
-        "future": None,
-        "subscribe": True,
-        "room_name": normalized_room_name,
-    }
+    metadata = runtime_context.create_task_record(
+        task_id=task_id,
+        created_at=created_at,
+        message="Group chat subscription started.",
+        subscribe=True,
+        room_name=normalized_room_name,
+    )
 
-    subscriber_queue = _group_chat_manager.subscribe(normalized_room_name)
+    subscriber_queue = group_chat_service.subscribe(normalized_room_name)
 
     async def _publisher() -> None:
         metadata["status"] = "running"
@@ -552,7 +668,7 @@ async def subscribe_group_chat_messages(
                 last_received_iso_time = _now_iso()
                 metadata["last_received_iso_time"] = last_received_iso_time
 
-                await _publish_subscription_message(
+                await runtime_context.publish_subscription_message(
                     {
                         "task_id": task_id,
                         "name": "subscribe_group_chat_messages",
@@ -575,7 +691,7 @@ async def subscribe_group_chat_messages(
             metadata["message"] = str(exc)
             last_received_iso_time = _now_iso()
             metadata["last_received_iso_time"] = last_received_iso_time
-            await _publish_subscription_message(
+            await runtime_context.publish_subscription_message(
                 {
                     "task_id": task_id,
                     "name": "subscribe_group_chat_messages",
@@ -589,14 +705,13 @@ async def subscribe_group_chat_messages(
             )
             raise
         finally:
-            _group_chat_manager.unsubscribe(
+            group_chat_service.unsubscribe(
                 normalized_room_name,
                 subscriber_queue,
             )
 
     fut = asyncio.create_task(_publisher())
-    metadata["future"] = fut
-    _tasks[task_id] = metadata
+    runtime_context.set_task_future(task_id, fut)
 
     return ToolResponse(
         content=[
@@ -623,18 +738,16 @@ async def subscribe_group_chat_messages(
         ],
     )
 
-
 async def send_group_chat_message(
-    sender_name: str,
     room_name: str = "global",
     text_message: str = "",
+    agent: CustomReActAgent | None = None,
+    group_chat_service: GroupChatService | None = None,
     **kwargs: Any,
 ) -> ToolResponse:
     """Send one text message to a target group chat room.
 
     Args:
-        sender_name (`str`):
-            The message sender name.
         room_name (`str`, defaults to `"global"`):
             The target room name.
         text_message (`str`, defaults to `""`):
@@ -644,6 +757,12 @@ async def send_group_chat_message(
         `ToolResponse`:
             A JSON object that indicates whether the send succeeds.
     """
+    if agent is None:
+        raise ValueError("agent is required.")
+    if group_chat_service is None:
+        raise ValueError("group_chat_service is required.")
+
+    sender_name = agent.name
 
     parsed_sender_name = _parse_json_if_needed(sender_name)
     parsed_room_name = _parse_json_if_needed(room_name)
@@ -683,7 +802,7 @@ async def send_group_chat_message(
     normalized_room_name = parsed_room_name.strip()
     normalized_text_message = parsed_text_message.strip()
 
-    is_success, delivered_count = await _group_chat_manager.send_message(
+    is_success, delivered_count = await group_chat_service.send_message(
         sender_name=normalized_sender_name,
         room_name=normalized_room_name,
         text_message=normalized_text_message,
@@ -714,8 +833,143 @@ async def send_group_chat_message(
         ],
     )
 
+async def batch_run_tool(
+    calls: list[dict[str, Any]] | str,
+    toolkit: Toolkit,
+) -> ToolResponse:
+    """Invoke registered tools in a single batch call.
+
+    Args:
+        calls (`list[dict[str, Any]] | str`): batch-call payload. Each
+            item should contain ``name`` and optional ``input``.
+    """
+
+    # helper that actually executes the tool and accumulates the final
+    # chunk as a single ``ToolResponse`` so callers get a normal object
+    async def _execute_once(
+        call_name: str,
+        call_input: dict | str | None,
+    ) -> ToolResponse:
+        # The agent sometimes serializes the input dict as a JSON string,
+        # so try to decode it back to a mapping for convenience.
+        parsed_input = _parse_json_if_needed(call_input)
+
+        call = {"name": call_name, "input": parsed_input}
+        final: ToolResponse | None = None
+
+        # `call_tool_function` returns a coroutine that yields an
+        # async-generator. Always await first, then consume chunks.
+        res_gen = await toolkit.call_tool_function(call)
+        if inspect.isasyncgen(res_gen):
+            async for chunk in res_gen:
+                final = _ensure_tool_response(chunk)
+        else:
+            final = _ensure_tool_response(res_gen)
+
+        return final or ToolResponse(content=[])
+
+    parsed_calls = _parse_json_if_needed(calls)
+    pending_calls: list[tuple[str, dict | str | None]] = []
+
+    if not isinstance(parsed_calls, list):
+        return ToolResponse(
+            content=[
+                TextBlock(
+                    type="text",
+                    text="Invalid calls format: expected list[dict].",
+                ),
+            ],
+        )
+
+    for index, call_item in enumerate(parsed_calls):
+        if not isinstance(call_item, dict):
+            return ToolResponse(
+                content=[
+                    TextBlock(
+                        type="text",
+                        text=f"Invalid call item at index {index}: expected dict.",
+                    ),
+                ],
+            )
+
+        call_name = call_item.get("name")
+        if not isinstance(call_name, str) or not call_name:
+            return ToolResponse(
+                content=[
+                    TextBlock(
+                        type="text",
+                        text=f"Invalid call item at index {index}: missing name.",
+                    ),
+                ],
+            )
+
+        # batch_run_tool previously expected parameters under the key
+        # "input". some clients (or older versions) may send
+        # "arguments" instead, so allow either and normalise to input.
+        call_input = None
+        if "input" in call_item:
+            call_input = call_item.get("input")
+        elif "arguments" in call_item:
+            call_input = call_item.get("arguments")
+
+        pending_calls.append((call_name, call_input))
+
+    if not pending_calls:
+        return ToolResponse(
+            content=[
+                TextBlock(
+                    type="text",
+                    text="calls must contain at least one tool call.",
+                ),
+            ],
+        )
+
+    call_results = await asyncio.gather(
+        *[
+            _execute_once(call_name, call_input)
+            for call_name, call_input in pending_calls
+        ],
+        return_exceptions=True,
+    )
+
+    merged_results: list[dict[str, str]] = []
+    for (call_name, _), call_result in zip(
+        pending_calls,
+        call_results,
+    ):
+        if isinstance(call_result, Exception):
+            merged_results.append(
+                {
+                    "name": call_name,
+                    "status": "failed",
+                    "error": str(call_result),
+                }
+            )
+            continue
+
+        merged_results.append(
+            {
+                "name": call_name,
+                "status": "completed",
+                "result": _extract_tool_response_text(call_result),
+            }
+        )
+
+    return ToolResponse(
+        content=[
+            TextBlock(
+                type="text",
+                text=json.dumps(
+                    {"results": merged_results},
+                    ensure_ascii=False,
+                ),
+            ),
+        ],
+    )
+
 async def wait_task_result(
     task_ids: list[str],
+    runtime_context: AgentRuntimeContext | None = None,
 ) -> ToolResponse:
     """Wait for background tasks to complete.
 
@@ -756,48 +1010,10 @@ async def wait_task_result(
             are filtered by target ``task_id`` rules.
     """
 
+    if runtime_context is None:
+        raise ValueError("runtime_context is required.")
+
     normalized_ids: list[str] = []
-
-    async def _get_subscription_message(
-        include_notify: bool = True,
-    ) -> dict[str, Any]:
-        get_tasks = [
-            asyncio.create_task(
-                _subscription_result_queues["default"].get(),
-            ),
-        ]
-        if include_notify:
-            get_tasks.append(
-                asyncio.create_task(
-                    _subscription_result_queues["notify"].get(),
-                )
-            )
-
-        done, pending = await asyncio.wait(
-            get_tasks,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        for pending_task in pending:
-            pending_task.cancel()
-
-        completed_task = next(iter(done))
-        return completed_task.result()
-
-    def _touch_message_timestamp(
-        one_message: dict[str, Any],
-    ) -> None:
-        start_iso_time = one_message.get("start_iso_time")
-        last_received_iso_time = _now_iso()
-
-        one_message["start_iso_time"] = start_iso_time
-        one_message["last_received_iso_time"] = last_received_iso_time
-
-        task_id = one_message.get("task_id")
-        if isinstance(task_id, str) and task_id in _tasks:
-            _tasks[task_id]["last_received_iso_time"] = (
-                last_received_iso_time
-            )
 
     def _append_subscription_payload(
         payload: list[dict[str, Any]],
@@ -823,13 +1039,13 @@ async def wait_task_result(
         # notify queue is always collected for task_ids mode.
         while True:
             try:
-                notify_message = _subscription_result_queues[
-                    "notify"
-                ].get_nowait()
+                notify_message = runtime_context.pop_subscription_message_nowait(
+                    "notify",
+                )
             except asyncio.QueueEmpty:
                 break
 
-            _touch_message_timestamp(notify_message)
+            runtime_context.touch_message_timestamp(notify_message)
             matched_messages.append(notify_message)
 
         # default queue is only collected for matched target task ids and
@@ -838,9 +1054,9 @@ async def wait_task_result(
         unmatched_default_messages: list[dict[str, Any]] = []
         while True:
             try:
-                one_message = _subscription_result_queues[
-                    "default"
-                ].get_nowait()
+                one_message = runtime_context.pop_subscription_message_nowait(
+                    "default",
+                )
             except asyncio.QueueEmpty:
                 break
 
@@ -854,13 +1070,16 @@ async def wait_task_result(
             )
 
             if is_target_task_message and not is_python_terminal_message:
-                _touch_message_timestamp(one_message)
+                runtime_context.touch_message_timestamp(one_message)
                 matched_messages.append(one_message)
             else:
                 unmatched_default_messages.append(one_message)
 
         for one_message in unmatched_default_messages:
-            await _subscription_result_queues["default"].put(one_message)
+            await runtime_context.put_subscription_message(
+                "default",
+                one_message,
+            )
 
         return matched_messages
 
@@ -868,10 +1087,10 @@ async def wait_task_result(
         buffered_results: list[dict[str, Any]] = []
 
         while True:
-            subscription_result = await _get_subscription_message(
+            subscription_result = await runtime_context.get_subscription_message(
                 include_notify=True,
             )
-            _touch_message_timestamp(subscription_result)
+            runtime_context.touch_message_timestamp(subscription_result)
 
             buffered_results.append(subscription_result)
 
@@ -943,7 +1162,7 @@ async def wait_task_result(
     async def _wait_one(
         one_task_id: str,
     ) -> dict[str, Any]:
-        info = _tasks.get(one_task_id)
+        info = runtime_context.get_task(one_task_id)
         start_iso_time: str | None = None
         if info is not None:
             start_iso_time = info.get("start_iso_time") or info.get("created_at")
@@ -1055,148 +1274,18 @@ async def wait_task_result(
         ],
     )
 
-async def main() -> None:
-    """The main entry point for the ReAct agent example."""
-    load_dotenv()
-    toolkit = Toolkit()
 
-    # ``batch_run_tool`` is a thin wrapper around the toolkit itself. It
-    # accepts a batch ``calls`` payload and returns merged results.
-    async def batch_run_tool(
-        calls: list[dict[str, Any]] | str,
-    ) -> ToolResponse:
-        """Invoke registered tools in a single batch call.
+def _build_agent(
+    name: str,
+    sys_prompt: str,
+    runtime_context: AgentRuntimeContext,
+    group_chat_service: GroupChatService,
+) -> CustomReActAgent:
+    """Create one demo agent and pre-bind tool dependencies."""
 
-        Args:
-            calls (`list[dict[str, Any]] | str`): batch-call payload. Each
-                item should contain ``name`` and optional ``input``.
-        """
-
-        # helper that actually executes the tool and accumulates the final
-        # chunk as a single ``ToolResponse`` so callers get a normal object
-        async def _execute_once(
-            call_name: str,
-            call_input: dict | str | None,
-        ) -> ToolResponse:
-            # The agent sometimes serializes the input dict as a JSON string,
-            # so try to decode it back to a mapping for convenience.
-            parsed_input = _parse_json_if_needed(call_input)
-
-            call = {"name": call_name, "input": parsed_input}
-            final: ToolResponse | None = None
-
-            # `call_tool_function` returns a coroutine that yields an
-            # async-generator. Always await first, then consume chunks.
-            res_gen = await toolkit.call_tool_function(call)
-            if inspect.isasyncgen(res_gen):
-                async for chunk in res_gen:
-                    final = _ensure_tool_response(chunk)
-            else:
-                final = _ensure_tool_response(res_gen)
-
-            return final or ToolResponse(content=[])
-
-        parsed_calls = _parse_json_if_needed(calls)
-        pending_calls: list[tuple[str, dict | str | None]] = []
-
-        if not isinstance(parsed_calls, list):
-            return ToolResponse(
-                content=[
-                    TextBlock(
-                        type="text",
-                        text="Invalid calls format: expected list[dict].",
-                    ),
-                ],
-            )
-
-        for index, call_item in enumerate(parsed_calls):
-            if not isinstance(call_item, dict):
-                return ToolResponse(
-                    content=[
-                        TextBlock(
-                            type="text",
-                            text=f"Invalid call item at index {index}: expected dict.",
-                        ),
-                    ],
-                )
-
-            call_name = call_item.get("name")
-            if not isinstance(call_name, str) or not call_name:
-                return ToolResponse(
-                    content=[
-                        TextBlock(
-                            type="text",
-                            text=f"Invalid call item at index {index}: missing name.",
-                        ),
-                    ],
-                )
-
-            pending_calls.append((call_name, call_item.get("input")))
-
-        if not pending_calls:
-            return ToolResponse(
-                content=[
-                    TextBlock(
-                        type="text",
-                        text="calls must contain at least one tool call.",
-                    ),
-                ],
-            )
-
-        call_results = await asyncio.gather(
-            *[
-                _execute_once(call_name, call_input)
-                for call_name, call_input in pending_calls
-            ],
-            return_exceptions=True,
-        )
-
-        merged_results: list[dict[str, str]] = []
-        for (call_name, _), call_result in zip(
-            pending_calls,
-            call_results,
-        ):
-            if isinstance(call_result, Exception):
-                merged_results.append(
-                    {
-                        "name": call_name,
-                        "status": "failed",
-                        "error": str(call_result),
-                    }
-                )
-                continue
-
-            merged_results.append(
-                {
-                    "name": call_name,
-                    "status": "completed",
-                    "result": _extract_tool_response_text(call_result),
-                }
-            )
-
-        return ToolResponse(
-            content=[
-                TextBlock(
-                    type="text",
-                    text=json.dumps(
-                        {"results": merged_results},
-                        ensure_ascii=False,
-                    ),
-                ),
-            ],
-        )
-
-    toolkit.register_tool_function(batch_run_tool)
-
-    toolkit.register_tool_function(execute_python_code)
-    toolkit.register_tool_function(subscribe_system_time)
-    toolkit.register_tool_function(subscribe_group_chat_messages)
-    toolkit.register_tool_function(send_group_chat_message)
-    toolkit.register_tool_function(wait_task_result)
-
-    agent = ReActAgent(
-        name="Friday",
-        sys_prompt="你是一个名叫Friday的中文对话个人助手。",
+    agent = CustomReActAgent(
+        name=name,
+        sys_prompt=sys_prompt,
         model=OpenAIChatModel(
             model_name="stepfun/step-3.5-flash:free",
             api_key=os.environ["OPENROUTER_API_KEY"],
@@ -1205,17 +1294,83 @@ async def main() -> None:
         ),
         memory=InMemoryMemory(),
         formatter=OpenAIChatFormatter(),
-        toolkit=toolkit,
+        toolkit=Toolkit(),
+    )
+    agent.runtime_context = runtime_context
+    agent.group_chat_service = group_chat_service
+
+    agent.toolkit.register_tool_function(
+        partial(batch_run_tool, toolkit=agent.toolkit),
+    )
+    agent.toolkit.register_tool_function(
+        partial(execute_python_code, runtime_context=agent.runtime_context),
+    )
+    agent.toolkit.register_tool_function(
+        partial(subscribe_system_time, runtime_context=agent.runtime_context),
+    )
+    agent.toolkit.register_tool_function(
+        partial(
+            subscribe_group_chat_messages,
+            runtime_context=agent.runtime_context,
+            group_chat_service=agent.group_chat_service,
+        ),
+    )
+    agent.toolkit.register_tool_function(
+        partial(
+            send_group_chat_message,
+            agent=agent,
+            group_chat_service=agent.group_chat_service,
+        ),
+    )
+    agent.toolkit.register_tool_function(
+        partial(wait_task_result, runtime_context=agent.runtime_context),
+    )
+    return agent
+
+async def main() -> None:
+    """The main entry point for the ReAct agent example."""
+    load_dotenv()
+
+    group_chat_service = GroupChatService()
+    friday_agent = _build_agent(
+        name="Friday",
+        sys_prompt="你是一个名叫Friday的中文对话个人助手。",
+        runtime_context=AgentRuntimeContext(),
+        group_chat_service=group_chat_service,
     )
 
     msg = Msg(
         name="user",
         content=(
             "你好，Friday！请按以下步骤完成群聊工具测试："
+            "1）先通过batch_run_tool调用subscribe_group_chat_messages，"
+            "传入room_name='global'完成订阅；"
+            "2）订阅成功后，再调用send_group_chat_message，"
+            "传入sender_name='Friday'、room_name='global'、"
+            "text_message='这是一条群聊测试消息'；"
+            "3）然后调用wait_task_result，主动传入task_ids=[]，"
+            "接收一条刚刚订阅到的群聊消息；"
+            "4）最后用中文反馈：发送是否成功、接收到的消息内容、"
+            "以及接收消息是否与发送内容一致。"
+        ),
+        role="user",
+    )
+    
+    _sunday_agent = _build_agent(
+        name="Sunday",
+        sys_prompt="你是一个名叫Sunday的中文对话个人助手。",
+        runtime_context=AgentRuntimeContext(),
+        group_chat_service=group_chat_service,
+    )
+    
+    _msg_2 = Msg(
+        name="user",
+        content=(
+            "你好，Sunday！请按以下步骤完成群聊工具测试："
             "1）先调用subscribe_group_chat_messages，"
             "传入room_name='global'完成订阅；"
             "2）订阅成功后，再调用send_group_chat_message，"
-            "传入sender_name='tester'、room_name='global'、"
+            "传入sender_name='Sunday'、room_name='global'、"
             "text_message='这是一条群聊测试消息'；"
             "3）然后调用wait_task_result，主动传入task_ids=[]，"
             "接收一条刚刚订阅到的群聊消息；"
@@ -1226,18 +1381,20 @@ async def main() -> None:
     )
     
     while True:
-        msg = await agent(msg)
-        if msg.get_text_content() == "exit":
-            break
+        await asyncio.gather(
+            friday_agent(msg),
+            # agent_2(msg_2),
+        )
         break
 
 if __name__ == "__main__":
     """
-    添加了一个消息房间管理器，支持工具函数订阅特定房间的消息，并将消息发布到等待队列中。
-    同时添加了一个发送消息的工具函数，可以向特定房间发送消息。演示了在非阻塞模式下工具函数主动推送结果的能力，以及工具函数之间的联动能力。
+    改为使用自定义的agent，默认将模型输出打印在data\temp\Friday.txt
+    改变工具解析方法，支持partial方式传入工具参数为对象，提高工具访问的灵活性和可扩展性
+    将_task等运行时参数整合到AgentRuntimeContext中，将chatroom封装为GroupChatService，
+    最后作为CustomReActAgent内部属性便于自定义工具函数访问任意数据
     """
     asyncio.run(main())
-
 
 
 
